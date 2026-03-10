@@ -17,7 +17,7 @@ Reiniciar ComfyUI.
 
 ```bash
 cd /workspace/ComfyUI/custom_nodes
-git clone https://github.com/TU_USUARIO/rafa-node-resize.git
+git clone https://github.com/osuvense/rafa-node-resize.git
 ```
 
 ## Uso
