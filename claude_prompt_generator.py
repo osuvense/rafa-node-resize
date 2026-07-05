@@ -54,7 +54,7 @@ HARDENING API (10 jun 2026, post-incidente 7-8 jun):
   (mismo patron que Captioner/Profiler, fix `4bc5100`).
 - Extraccion de texto robusta a bloques thinking (`_extract_text`).
 - Usage (in/out/cache_w/cache_r) en el log de consola por llamada.
-- max_tokens escala con `variants` (2048 base / 4096 con 4+).
+- max_tokens escala con `variants` (4096 base / 8192 con 4+; subido 5 jul 2026, JSON truncado).
 
 Compatibilidad: los outputs originales (prompt/razonamiento) conservan su posicion;
 los nuevos (clip_l/t5xxl/negative) van al final. OJO (4 jun 2026): el reorden de
@@ -771,7 +771,10 @@ class ClaudePromptGenerator:
         try:
             api_kwargs = dict(
                 model=claude_model.strip() or "claude-sonnet-4-6",
-                max_tokens=(4096 if int(variants) >= 4 else 2048),
+                # 4096 base: FLUX.1 legacy emite ~2x (prompt preview + clip_l + t5xxl +
+                # negative) y con 2048 el JSON llegaba truncado -> 'Unterminated string'
+                # -> fallback raw como prompt (bug verificado 5 jul 2026, bot.out.log).
+                max_tokens=(8192 if int(variants) >= 4 else 4096),
                 temperature=temperature,
                 system=system_param,
                 messages=[{"role": "user", "content": scene}],
