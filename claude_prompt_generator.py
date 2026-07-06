@@ -50,7 +50,7 @@ HARDENING API (10 jun 2026, post-incidente 7-8 jun):
   ESTABLE (core + guia de modelo + taste + docs de LoRAs; cache_control ephemeral)
   y bloque VARIABLE (dials + formato). Re-llamadas con los mismos toggles pagan el
   bloque gordo a ~0.1x.
-- Fallback de `temperature` deprecada (Opus 4.8/4.7 → 400): se reintenta sin ella
+- Fallback de `temperature` deprecada (Sonnet 5 / Opus 4.8/4.7 → 400): familias conocidas se omiten de entrada; rechazos nuevos se recuerdan a nivel de proceso
   (mismo patron que Captioner/Profiler, fix `4bc5100`).
 - Extraccion de texto robusta a bloques thinking (`_extract_text`).
 - Usage (in/out/cache_w/cache_r) en el log de consola por llamada.
@@ -409,6 +409,22 @@ FRAMINGS = ["auto", "portrait", "upper body", "full body", "genital close-up"]
 SECTION_SEP = "\n\n" + "=" * 50 + "\n\n"
 
 
+# --- `temperature` deprecada: memoria DE PROCESO (fix 6 jul 2026) ---
+# prompt_host.py (bot v2) crea una instancia NUEVA por generacion, asi que el
+# flag de instancia se perdia y cada llamada pagaba un 400 + retry.
+# Familias confirmadas que rechazan temperature (400 "deprecated"):
+# claude-sonnet-5 (verificado en vivo, bot v2 jul 2026) y Opus 4.8/4.7 (doc).
+# Para esas se omite de entrada; para cualquier otra que devuelva el 400,
+# el set de modulo recuerda el rechazo el resto del proceso.
+_TEMP_DEPRECATED_PREFIXES = ("claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7")
+_TEMP_UNSUPPORTED_MODELS: set = set()
+
+
+def _temp_rejected(model: str) -> bool:
+    m = str(model or "")
+    return m.startswith(_TEMP_DEPRECATED_PREFIXES) or m in _TEMP_UNSUPPORTED_MODELS
+
+
 class ClaudePromptGenerator:
     """
     Meganodo de generacion de prompts via Claude API.
@@ -418,7 +434,6 @@ class ClaudePromptGenerator:
     def __init__(self):
         self.api_key = os.getenv("ANTHROPIC_API_KEY", "")
         self.client = None
-        self._temp_unsupported = False
 
     @classmethod
     def INPUT_TYPES(cls) -> Dict[str, Any]:
@@ -486,7 +501,7 @@ class ClaudePromptGenerator:
                 "creativity": ("FLOAT", {
                     "default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Mapea a temperature. Bajo = fiel/estable; alto = improvisa mas. "
-                               "OJO: Opus 4.8/4.7 deprecan temperature; el nodo la omite solo si el modelo la rechaza."
+                               "OJO: Sonnet 5 y Opus 4.8/4.7 deprecan temperature; el nodo la omite solo (sin 400) en esas familias."
                 }),
                 "seed": ("INT", {
                     "default": 0, "min": 0, "max": 0xffffffffffffffff,
@@ -671,10 +686,11 @@ class ClaudePromptGenerator:
 
     def _create_with_fallback(self, api_kwargs):
         """messages.create con la salvaguarda de `temperature` deprecada
-        (Opus 4.8/4.7 → 400 '`temperature` is deprecated for this model.'):
-        reintenta sin ella y no la reenvia el resto de la sesion del nodo.
-        Mismo patron que Captioner/Profiler (fix `4bc5100`)."""
-        if self._temp_unsupported:
+        (Sonnet 5 / Opus 4.8/4.7 → 400 '`temperature` is deprecated for this model.'):
+        para familias conocidas se omite DE ENTRADA; ante un 400 nuevo se
+        reintenta sin ella y se recuerda A NIVEL DE PROCESO (no de instancia:
+        prompt_host crea una instancia por generacion — fix 6 jul 2026)."""
+        if _temp_rejected(api_kwargs.get("model")):
             api_kwargs.pop("temperature", None)
         try:
             return self.client.messages.create(**api_kwargs)
@@ -682,7 +698,7 @@ class ClaudePromptGenerator:
             msg = str(e).lower()
             if "temperature" in api_kwargs and "temperature" in msg \
                     and ("deprecat" in msg or "not supported" in msg or "unsupported" in msg):
-                self._temp_unsupported = True
+                _TEMP_UNSUPPORTED_MODELS.add(str(api_kwargs.get("model", "")))
                 kwargs = dict(api_kwargs)
                 kwargs.pop("temperature", None)
                 print("[ClaudePromptGenerator] El modelo no admite 'temperature' (deprecada); se omite.")
