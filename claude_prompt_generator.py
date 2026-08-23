@@ -420,7 +420,30 @@ _TEMP_DEPRECATED_PREFIXES = ("claude-sonnet-5", "claude-opus-4-8", "claude-opus-
 _TEMP_UNSUPPORTED_MODELS: set = set()
 
 
+# --- Compat SDK anthropic >= 1.0.0 (PyPI 20/08/2026): `temperature` ELIMINADA ---
+# La 1.0.0 borro temperature/top_p/top_k de messages.create(). Ya no es un 400 de
+# la API sino un TypeError LOCAL de Python ("unexpected keyword argument
+# 'temperature'"), que el fallback antiguo no reconocia y escupia como
+# "Error inesperado". Se detecta por introspeccion de la firma una sola vez por
+# proceso y se omite el kwarg de entrada.
+_SDK_HAS_TEMPERATURE = None
+
+
+def _sdk_accepts_temperature() -> bool:
+    global _SDK_HAS_TEMPERATURE
+    if _SDK_HAS_TEMPERATURE is None:
+        try:
+            import inspect
+            from anthropic.resources.messages import Messages
+            _SDK_HAS_TEMPERATURE = "temperature" in inspect.signature(Messages.create).parameters
+        except Exception:
+            _SDK_HAS_TEMPERATURE = True  # ante la duda se intenta; el retry lo cubre
+    return bool(_SDK_HAS_TEMPERATURE)
+
+
 def _temp_rejected(model: str) -> bool:
+    if not _sdk_accepts_temperature():
+        return True  # SDK >= 1.0.0: no existe el parametro, da igual el modelo
     m = str(model or "")
     return m.startswith(_TEMP_DEPRECATED_PREFIXES) or m in _TEMP_UNSUPPORTED_MODELS
 
@@ -696,12 +719,18 @@ class ClaudePromptGenerator:
             return self.client.messages.create(**api_kwargs)
         except Exception as e:
             msg = str(e).lower()
+            sdk_sig = isinstance(e, TypeError) and "unexpected keyword argument" in msg
             if "temperature" in api_kwargs and "temperature" in msg \
-                    and ("deprecat" in msg or "not supported" in msg or "unsupported" in msg):
+                    and (sdk_sig or "deprecat" in msg or "not supported" in msg
+                         or "unsupported" in msg):
+                if sdk_sig:
+                    global _SDK_HAS_TEMPERATURE
+                    _SDK_HAS_TEMPERATURE = False
                 _TEMP_UNSUPPORTED_MODELS.add(str(api_kwargs.get("model", "")))
                 kwargs = dict(api_kwargs)
                 kwargs.pop("temperature", None)
-                print("[ClaudePromptGenerator] El modelo no admite 'temperature' (deprecada); se omite.")
+                print("[ClaudePromptGenerator] 'temperature' no admitida "
+                      "(SDK >=1.0.0 la elimino / modelo la deprecó); se omite.")
                 return self.client.messages.create(**kwargs)
             raise
 

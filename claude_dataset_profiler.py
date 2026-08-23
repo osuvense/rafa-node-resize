@@ -255,6 +255,27 @@ Low resolution / quality:
 # NODO
 # ============================================================
 
+# --- Compat SDK anthropic >= 1.0.0 (PyPI 20/08/2026): `temperature` ELIMINADA ---
+# La 1.0.0 borro temperature/top_p/top_k de messages.create(). Ya no es un 400 de
+# la API sino un TypeError LOCAL de Python ("unexpected keyword argument
+# 'temperature'"), que el fallback antiguo no reconocia y escupia como
+# "Error inesperado". Se detecta por introspeccion de la firma una sola vez por
+# proceso y se omite el kwarg de entrada.
+_SDK_HAS_TEMPERATURE = None
+
+
+def _sdk_accepts_temperature() -> bool:
+    global _SDK_HAS_TEMPERATURE
+    if _SDK_HAS_TEMPERATURE is None:
+        try:
+            import inspect
+            from anthropic.resources.messages import Messages
+            _SDK_HAS_TEMPERATURE = "temperature" in inspect.signature(Messages.create).parameters
+        except Exception:
+            _SDK_HAS_TEMPERATURE = True  # ante la duda se intenta; el retry lo cubre
+    return bool(_SDK_HAS_TEMPERATURE)
+
+
 class ClaudeDatasetProfiler:
     """
     Dataset Profiler / Auditor. Submuestrea el dataset y emite un Dataset Profile
@@ -493,21 +514,29 @@ class ClaudeDatasetProfiler:
           '`temperature` is deprecated for this model.'), reintenta sin ella y marca
           el modelo para no reenviarla en el resto de la ejecución (el muestreo lo
           controla 'effort')."""
-        if getattr(self, "_temp_unsupported", False):
+        if getattr(self, "_temp_unsupported", False) or not _sdk_accepts_temperature():
             api_kwargs.pop("temperature", None)
         try:
             return client.messages.create(**api_kwargs)
         except TypeError:
+            # SDK viejo: output_config/thinking no estan en la firma -> extra_body.
+            # SDK >= 1.0.0: 'temperature' ya no existe -> se cae, no se reenvia.
             extra = {}
             kwargs = dict(api_kwargs)
             for k in ("output_config", "thinking"):
                 if k in kwargs:
                     extra[k] = kwargs.pop(k)
-            return client.messages.create(extra_body=extra, **kwargs)
+            if kwargs.pop("temperature", None) is not None:
+                self._temp_unsupported = True
+                logs.append("[INFO] El SDK anthropic instalado (>=1.0.0) no admite "
+                            "'temperature'; se omite en el resto del batch.")
+            return client.messages.create(extra_body=extra, **kwargs) if extra \
+                else client.messages.create(**kwargs)
         except Exception as e:
             msg = str(e).lower()
             if "temperature" in api_kwargs and "temperature" in msg \
-                    and ("deprecat" in msg or "not supported" in msg or "unsupported" in msg):
+                    and ("deprecat" in msg or "not supported" in msg
+                         or "unsupported" in msg or "unexpected keyword argument" in msg):
                 self._temp_unsupported = True
                 kwargs = dict(api_kwargs)
                 kwargs.pop("temperature", None)
