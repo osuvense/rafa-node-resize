@@ -51,6 +51,10 @@ HARDENING API (10 jun 2026, post-incidente 7-8 jun):
   y bloque VARIABLE (dials + formato). Re-llamadas con los mismos toggles pagan el
   bloque gordo a ~0.1x.
 - Fallback de `temperature` deprecada (Sonnet 5 / Opus 4.8/4.7 → 400): familias conocidas se omiten de entrada; rechazos nuevos se recuerdan a nivel de proceso
+- Compat SDK anthropic >=1.0.0 (20/08/2026): la 1.0.0 saca temperature/top_p/top_k
+  de la firma de messages.create() (TypeError local, no 400). El nodo detecta la
+  firma por introspeccion y, si el modelo no la ha deprecado, la envia por
+  extra_body como manda MIGRATION.md v1; si el modelo la rechaza, se omite.
   (mismo patron que Captioner/Profiler, fix `4bc5100`).
 - Extraccion de texto robusta a bloques thinking (`_extract_text`).
 - Usage (in/out/cache_w/cache_r) en el log de consola por llamada.
@@ -441,9 +445,38 @@ def _sdk_accepts_temperature() -> bool:
     return bool(_SDK_HAS_TEMPERATURE)
 
 
+def _temp_via_extra_body(api_kwargs: dict) -> dict:
+    """SDK >= 1.0.0: `temperature` ya no esta en la firma de messages.create(),
+    pero la API la SIGUE honrando en los modelos anteriores al cambio; la guia
+    oficial de migracion v1 manda enviarla por `extra_body` (ejemplo literal con
+    claude-sonnet-4-6). Se hace solo si el SDK no la admite y el modelo no la ha
+    deprecado; si la API acaba rechazandola, el retry la borra de extra_body."""
+    t = api_kwargs.pop("temperature", None)
+    if t is None:
+        return api_kwargs
+    eb = dict(api_kwargs.get("extra_body") or {})
+    eb.setdefault("temperature", t)
+    api_kwargs["extra_body"] = eb
+    return api_kwargs
+
+
+def _strip_temp(kwargs: dict) -> dict:
+    """Quita temperature esta donde este (kwarg nativo o extra_body)."""
+    kwargs = dict(kwargs)
+    kwargs.pop("temperature", None)
+    eb = kwargs.get("extra_body")
+    if isinstance(eb, dict) and "temperature" in eb:
+        eb = {k: v for k, v in eb.items() if k != "temperature"}
+        if eb:
+            kwargs["extra_body"] = eb
+        else:
+            kwargs.pop("extra_body", None)
+    return kwargs
+
+
 def _temp_rejected(model: str) -> bool:
-    if not _sdk_accepts_temperature():
-        return True  # SDK >= 1.0.0: no existe el parametro, da igual el modelo
+    """El MODELO ha deprecado temperature (400). Independiente de si el SDK la
+    admite en la firma: eso lo resuelve _sdk_accepts_temperature()/extra_body."""
     m = str(model or "")
     return m.startswith(_TEMP_DEPRECATED_PREFIXES) or m in _TEMP_UNSUPPORTED_MODELS
 
@@ -713,24 +746,31 @@ class ClaudePromptGenerator:
         para familias conocidas se omite DE ENTRADA; ante un 400 nuevo se
         reintenta sin ella y se recuerda A NIVEL DE PROCESO (no de instancia:
         prompt_host crea una instancia por generacion — fix 6 jul 2026)."""
+        api_kwargs = dict(api_kwargs)
         if _temp_rejected(api_kwargs.get("model")):
             api_kwargs.pop("temperature", None)
+        elif not _sdk_accepts_temperature():
+            api_kwargs = _temp_via_extra_body(api_kwargs)
+        had_temp = "temperature" in api_kwargs or \
+            "temperature" in (api_kwargs.get("extra_body") or {})
         try:
             return self.client.messages.create(**api_kwargs)
         except Exception as e:
             msg = str(e).lower()
             sdk_sig = isinstance(e, TypeError) and "unexpected keyword argument" in msg
-            if "temperature" in api_kwargs and "temperature" in msg \
+            if had_temp and "temperature" in msg \
                     and (sdk_sig or "deprecat" in msg or "not supported" in msg
                          or "unsupported" in msg):
                 if sdk_sig:
                     global _SDK_HAS_TEMPERATURE
                     _SDK_HAS_TEMPERATURE = False
-                _TEMP_UNSUPPORTED_MODELS.add(str(api_kwargs.get("model", "")))
-                kwargs = dict(api_kwargs)
-                kwargs.pop("temperature", None)
+                else:
+                    # rechazo real de la API: es el MODELO quien no la admite
+                    _TEMP_UNSUPPORTED_MODELS.add(str(api_kwargs.get("model", "")))
+                kwargs = _strip_temp(api_kwargs)
                 print("[ClaudePromptGenerator] 'temperature' no admitida "
-                      "(SDK >=1.0.0 la elimino / modelo la deprecó); se omite.")
+                      "(SDK >=1.0.0 la saco de la firma / el modelo la deprecó); "
+                      "se reintenta sin ella.")
                 return self.client.messages.create(**kwargs)
             raise
 

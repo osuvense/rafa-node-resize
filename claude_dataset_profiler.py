@@ -276,6 +276,35 @@ def _sdk_accepts_temperature() -> bool:
     return bool(_SDK_HAS_TEMPERATURE)
 
 
+def _temp_via_extra_body(api_kwargs: dict) -> dict:
+    """SDK >= 1.0.0: `temperature` ya no esta en la firma de messages.create(),
+    pero la API la SIGUE honrando en los modelos anteriores al cambio; la guia
+    oficial de migracion v1 manda enviarla por `extra_body` (ejemplo literal con
+    claude-sonnet-4-6). Se hace solo si el SDK no la admite y el modelo no la ha
+    deprecado; si la API acaba rechazandola, el retry la borra de extra_body."""
+    t = api_kwargs.pop("temperature", None)
+    if t is None:
+        return api_kwargs
+    eb = dict(api_kwargs.get("extra_body") or {})
+    eb.setdefault("temperature", t)
+    api_kwargs["extra_body"] = eb
+    return api_kwargs
+
+
+def _strip_temp(kwargs: dict) -> dict:
+    """Quita temperature esta donde este (kwarg nativo o extra_body)."""
+    kwargs = dict(kwargs)
+    kwargs.pop("temperature", None)
+    eb = kwargs.get("extra_body")
+    if isinstance(eb, dict) and "temperature" in eb:
+        eb = {k: v for k, v in eb.items() if k != "temperature"}
+        if eb:
+            kwargs["extra_body"] = eb
+        else:
+            kwargs.pop("extra_body", None)
+    return kwargs
+
+
 class ClaudeDatasetProfiler:
     """
     Dataset Profiler / Auditor. Submuestrea el dataset y emite un Dataset Profile
@@ -514,32 +543,37 @@ class ClaudeDatasetProfiler:
           '`temperature` is deprecated for this model.'), reintenta sin ella y marca
           el modelo para no reenviarla en el resto de la ejecución (el muestreo lo
           controla 'effort')."""
-        if getattr(self, "_temp_unsupported", False) or not _sdk_accepts_temperature():
+        api_kwargs = dict(api_kwargs)
+        if getattr(self, "_temp_unsupported", False):
             api_kwargs.pop("temperature", None)
+        elif not _sdk_accepts_temperature():
+            # SDK >= 1.0.0: fuera de la firma, pero la API la honra en modelos
+            # anteriores al cambio -> se envia por extra_body (MIGRATION.md v1).
+            api_kwargs = _temp_via_extra_body(api_kwargs)
+        had_temp = "temperature" in api_kwargs or \
+            "temperature" in (api_kwargs.get("extra_body") or {})
         try:
             return client.messages.create(**api_kwargs)
-        except TypeError:
+        except TypeError as e:
             # SDK viejo: output_config/thinking no estan en la firma -> extra_body.
-            # SDK >= 1.0.0: 'temperature' ya no existe -> se cae, no se reenvia.
-            extra = {}
+            extra = dict(api_kwargs.get("extra_body") or {})
             kwargs = dict(api_kwargs)
+            kwargs.pop("extra_body", None)
             for k in ("output_config", "thinking"):
                 if k in kwargs:
                     extra[k] = kwargs.pop(k)
-            if kwargs.pop("temperature", None) is not None:
-                self._temp_unsupported = True
-                logs.append("[INFO] El SDK anthropic instalado (>=1.0.0) no admite "
-                            "'temperature'; se omite en el resto del batch.")
+            if "temperature" in str(e).lower() and "temperature" in kwargs:
+                # el TypeError venia de temperature: no se reenvia como kwarg
+                extra.setdefault("temperature", kwargs.pop("temperature"))
             return client.messages.create(extra_body=extra, **kwargs) if extra \
                 else client.messages.create(**kwargs)
         except Exception as e:
             msg = str(e).lower()
-            if "temperature" in api_kwargs and "temperature" in msg \
+            if had_temp and "temperature" in msg \
                     and ("deprecat" in msg or "not supported" in msg
                          or "unsupported" in msg or "unexpected keyword argument" in msg):
                 self._temp_unsupported = True
-                kwargs = dict(api_kwargs)
-                kwargs.pop("temperature", None)
+                kwargs = _strip_temp(api_kwargs)
                 logs.append("[INFO] El modelo no admite 'temperature' (deprecada); se omite (control por 'effort').")
                 return client.messages.create(**kwargs)
             raise
